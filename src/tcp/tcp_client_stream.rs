@@ -8,6 +8,7 @@
 use std;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::io;
+use std::io::{Read, Write};
 
 use futures::{AndThen, Async, BoxFuture, Flatten, Future, Poll};
 use futures::stream::{Fuse, Peekable, Stream};
@@ -17,21 +18,13 @@ use rand;
 use tokio_core;
 use tokio_core::net::TcpStream as TokioTcpStream;
 use tokio_core::channel::{channel, Sender, Receiver};
-use tokio_core::io::{read_exact, ReadExact, write_all, WriteAll};
+use tokio_core::io::{Io, read_exact, ReadExact, ReadHalf, write_all, WriteAll, WriteHalf};
 use tokio_core::reactor::{Handle};
 
 pub type TcpClientStreamHandle = Sender<Vec<u8>>;
 
 pub struct TcpClientStream {
-  name_server: SocketAddr,
-  socket: TokioTcpStream,
-  outbound_messages: Peekable<Fuse<Receiver<Vec<u8>>>>,
-  // TODO: would be nice to not use box, this would be close to the field without that:
-  // sending: Option<AndThen<WriteAll<TokioTcpStream, [u8; 2]>,
-  //                         WriteAll<TokioTcpStream, Vec<u8>>,
-  //                         (Fn( (TokioTcpStream, Vec<u8>) ) -> WriteAll<TokioTcpStream, Vec<u8>> ) >>,
-  // sending: Option<BoxFuture<(TokioTcpStream, Vec<u8>), io::Error>>,
-  // receiving: Option<BoxFuture<, io::Error>>,
+  socket: ReadHalf<TokioTcpStream>,
 }
 
 impl TcpClientStream {
@@ -46,12 +39,16 @@ impl TcpClientStream {
     //  sending and receiving tcp packets.
     let stream: Box<Future<Item=TcpClientStream, Error=io::Error>> = Box::new(tcp
       .map(move |tcp_stream| {
-        TcpClientStream {
-          name_server: name_server,
-          socket: tcp_stream,
+        let (reader, writer) = tcp_stream.split();
+
+        loop_handle.spawn(TcpClientStreamWriter {
+          socket: writer,
           outbound_messages: outbound_messages.fuse().peekable(),
-          // sending: None,
-          // receiving: None,
+        }
+        .map_err(|e| debug!("error in writer: {}", e)));
+
+        TcpClientStream {
+          socket: reader,
         }
       }));
 
@@ -64,7 +61,45 @@ impl Stream for TcpClientStream {
   type Error = io::Error;
 
   fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-    debug!("being polled");
+    debug!("reader being polled");
+
+    // // For QoS, this will only accept one message and output that
+    // // recieve all inbound messages
+    // if let Async::NotReady = self.socket.poll_read() {
+    //   debug!("nothing ready");
+    //   // nothing to read
+    //   // TODO: check if outbound_messages is closed and return None?
+    //   return Ok(Async::NotReady);
+    // }
+
+    // getting here means that there was something to read
+    let mut len_bytes = [0u8; 2];
+    debug!("waiting for length");
+    try!(self.socket.read_exact(&mut len_bytes));
+
+    let length = (len_bytes[0] as u16) << 8 & 0xFF00 | len_bytes[1] as u16 & 0x00FF;
+    debug!("read length: {}", length);
+
+    // TODO: how can we reuse the same buffer?
+    let mut buffer: Vec<u8> = Vec::with_capacity(length as usize);
+    buffer.resize(length as usize, 0);
+    try!(self.socket.read_exact(&mut buffer));
+
+    return Ok(Async::Ready(Some(buffer)))
+  }
+}
+
+pub struct TcpClientStreamWriter {
+  socket: WriteHalf<TokioTcpStream>,
+  outbound_messages: Peekable<Fuse<Receiver<Vec<u8>>>>,
+}
+
+impl Future for TcpClientStreamWriter {
+  type Item = ();
+  type Error = io::Error;
+
+  fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    debug!("writer being polled");
 
     // this will not accept incoming data while there is data to send
     //  makes this self throttling.
@@ -81,65 +116,19 @@ impl Stream for TcpClientStream {
           let len: [u8; 2] = [(buffer.len() >> 8 & 0xFF) as u8,
                               (buffer.len() & 0xFF) as u8];
 
-          let mut sending = write_all(&self.socket, len)
-                        .and_then(|(socket, _)| write_all(socket, buffer));
-
-          // loop through the sending of the message
-          // TODO: timeout here?
-          loop {
-            match sending.poll() {
-              // message was sent
-              Ok(Async::Ready((_, _))) => break,
-              // return an error
-              Err(e) => return Err(e),
-              // yield and loop until everything sent (no other progress will be made)
-              Ok(Async::NotReady) => park().unpark(),
-            }
-          }
+          try!(self.socket.write_all(&len));
+          try!(self.socket.write_all(&buffer));
         },
         // now we get to drop through to the receives...
         // TODO: should we also return None if there are no more messages to send?
-        Async::NotReady | Async::Ready(None) => break,
-      }
-    }
-
-    debug!("continuing");
-
-    // For QoS, this will only accept one message and output that
-    // recieve all inbound messages
-    if let Async::NotReady = self.socket.poll_read() {
-      debug!("nothing ready");
-      // nothing to read
-      // TODO: check if outbound_messages is closed and return None?
-      return Ok(Async::NotReady);
-    }
-
-    // getting here means that there was something to read
-    let len_bytes = [0u8; 2];
-    let mut reading = read_exact(&self.socket, len_bytes)
-                  .and_then(|(socket, len_bytes)| {
-                    debug!("waiting for length");
-                    let length = (len_bytes[0] as u16) << 8 & 0xFF00 | len_bytes[1] as u16 & 0x00FF;
-                    debug!("read length: {}", length);
-
-                     // TODO: how can we reuse the same buffer?
-                    let mut buffer: Vec<u8> = Vec::with_capacity(length as usize);
-                    buffer.resize(length as usize, 0);
-                    read_exact(socket, buffer)
-                  });
-
-    // TODO: timeout here, or just put that on the socket?
-    loop {
-      match reading.poll() {
-        // return the read buffer
-        Ok(Async::Ready((_, buffer))) => {
-          debug!("read bytes: {}", buffer.len());
-          return Ok(Async::Ready(Some(buffer)))
+        Async::NotReady => {
+          debug!("yeilding waiting for messages");
+          park().unpark()
         },
-        // return an error
-        Err(e) => return Err(e),
-        // yield and loop until there is more data (this will block sending)
-        Ok(Async::NotReady) => park().unpark(),
+        Async::Ready(None) => {
+          debug!("ending, no more messages");
+          return Ok(Async::Ready(()))
+        },
       }
     }
   }
@@ -177,7 +166,7 @@ fn tcp_client_stream_test(server_addr: IpAddr) {
   let server = std::net::TcpListener::bind(SocketAddr::new(server_addr, 0)).unwrap();
   let server_addr = server.local_addr().unwrap();
 
-  let send_recv_times = 2;
+  let send_recv_times = 1;
 
   // an in and out server
   let server_handle = thread::Builder::new().name("test_tcp_client_stream_ipv4:server".to_string()).spawn(move || {
