@@ -15,6 +15,7 @@ use rustls::{Certificate, ClientConfig, ClientSession};
 use tokio_core::net::TcpStream as TokioTcpStream;
 use tokio_core::reactor::Handle;
 use tokio_rustls::{ClientConfigExt, TlsStream as TokioTlsStream};
+use webpki::{DNSName, DNSNameRef};
 
 use trust_dns::BufStreamHandle;
 use trust_dns::error::ClientError;
@@ -153,8 +154,13 @@ impl TlsStreamBuilder {
         //  sending and receiving tcp packets.
         let stream: Box<Future<Item = TlsStream, Error = io::Error>> = Box::new(
             tcp.and_then(move |tcp_stream| {
+                let dns_name = DNSNameRef::try_from_ascii_str(&dns_name).map(DNSName::from);
+                
+                dns_name.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("bad dns_name")))
+                        .into_future()
+                        .and_then(move |dns_name|
                 tls_connector
-                    .connect_async(&dns_name, tcp_stream)
+                    .connect_async(dns_name.as_ref(), tcp_stream)
                     .map(move |s| {
                         TcpStream::from_stream_with_receiver(s, name_server, outbound_messages)
                     })
@@ -164,6 +170,7 @@ impl TlsStreamBuilder {
                             format!("tls error: {}", e),
                         )
                     })
+                )
             }).map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::ConnectionRefused,
